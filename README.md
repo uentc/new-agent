@@ -89,7 +89,31 @@ bash <(curl -fsSL https://raw.githubusercontent.com/uentc/new-agent/main/install
 
 Run the command above, then choose from the menu.
 
+After installation, you can enter the menu again with the short command:
+
+```bash
+na
+```
+
+You can also explicitly enter shell/menu mode from the remote script:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/uentc/new-agent/main/install.sh) sh
+```
+
 复制上面这一条命令运行，然后在菜单里选择功能。
+
+安装后也可以直接输入短命令进入菜单：
+
+```bash
+na
+```
+
+也可以通过远程脚本显式进入 sh/菜单模式：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/uentc/new-agent/main/install.sh) sh
+```
 
 Menu / 菜单：
 
@@ -155,11 +179,13 @@ Choose menu option `6` to detect an existing installation.
 
 - If installed by New Agent, it prints the subscription links.
 - If it finds the legacy `/etc/proxy-node` layout, it prints compatible subscription links.
+- If a lightcone/proxy-node stack already exists, menu option `1` will not overwrite it by default. Use option `2` to change its domain safely, option `3` to show links, or option `6` to inspect it.
 - If another script such as lightclone installed the stack, New Agent will try to parse sing-box/Xray configs and show protocols, ports, and running services.
 - If that script stores credentials in a private custom path, New Agent cannot reconstruct full share links unless the path is known.
 
 - 如果是 New Agent 安装的，会直接显示订阅链接。
 - 如果检测到旧版 `/etc/proxy-node` 结构，会显示兼容订阅链接。
+- 如果已经存在 lightcone/proxy-node 工作栈，菜单 `1` 默认不会覆盖它。请用菜单 `2` 安全更换域名，用菜单 `3` 显示订阅，或用菜单 `6` 检测现有节点。
 - 如果是 lightclone 这类其他脚本安装的，会尽量解析 sing-box/Xray 配置，显示协议、端口和运行服务。
 - 如果对方脚本把密钥存在私有路径，且路径未知，New Agent 无法还原完整分享链接，只能显示检测到的配置摘要。
 

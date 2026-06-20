@@ -17,8 +17,15 @@ SUB_ROOT="/opt/${APP_NAME}/public"
 SUB_SERVER="/opt/${APP_NAME}/server.py"
 SUB_SCRIPT="/usr/local/bin/${APP_NAME}-subscription"
 SHOW_SCRIPT="/usr/local/bin/${APP_NAME}-show"
+MENU_SCRIPT="/usr/local/bin/${APP_NAME}"
+SHORT_SCRIPT="/usr/local/bin/na"
 UNIT_SUB="/etc/systemd/system/${APP_NAME}-subscription.service"
 UNIT_HOP="/etc/systemd/system/${APP_NAME}-port-hopping.service"
+LEGACY_STATE_FILE="/etc/proxy-node/credentials.env"
+LEGACY_TOKEN_FILE="/etc/proxy-node/sub_token"
+LEGACY_CERT_DIR="/etc/proxy-node/certs"
+LEGACY_SUB_GENERATOR="/root/setup_subscription_gui_compat.sh"
+LEGACY_LINKS_FILE="/root/proxy-subscription-links.txt"
 SUB_PORT="2053"
 
 DOMAIN=""
@@ -46,6 +53,7 @@ Usage:
   bash install.sh change-domain
   bash install.sh detect
   bash install.sh show
+  bash install.sh sh
   bash install.sh status
   bash install.sh uninstall
 
@@ -62,7 +70,7 @@ EOF
 ACTION="menu"
 if [[ $# -gt 0 ]]; then
   case "$1" in
-    install|uninstall|status|show|change-domain|detect|menu)
+    install|uninstall|status|show|change-domain|detect|menu|sh|shell)
       ACTION="$1"
       shift
       ;;
@@ -744,6 +752,11 @@ EOF
 }
 
 write_systemd() {
+  local sing_box_bin xray_bin
+  sing_box_bin="$(command -v sing-box || true)"
+  xray_bin="$(command -v xray || true)"
+  [[ -n "$sing_box_bin" ]] || die "sing-box binary not found."
+  [[ -n "$xray_bin" ]] || die "xray binary not found."
   cat >/etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
@@ -752,7 +765,7 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/sing-box run -c ${SING_BOX_CONFIG}
+ExecStart=${sing_box_bin} run -c ${SING_BOX_CONFIG}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=infinity
@@ -771,7 +784,7 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/xray run -config ${XRAY_CONFIG}
+ExecStart=${xray_bin} run -config ${XRAY_CONFIG}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1000000
@@ -832,8 +845,28 @@ start_services() {
   systemctl enable --now sing-box xray "${APP_NAME}-subscription" "${APP_NAME}-port-hopping"
 }
 
+install_shortcuts() {
+  if [[ -r "${BASH_SOURCE[0]}" ]]; then
+    install -m 0755 "${BASH_SOURCE[0]}" "$MENU_SCRIPT"
+  else
+    cat >"$MENU_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec bash <(curl -fsSL https://raw.githubusercontent.com/uentc/new-agent/main/install.sh) "$@"
+EOF
+    chmod +x "$MENU_SCRIPT"
+  fi
+  ln -sf "$MENU_SCRIPT" "$SHORT_SCRIPT"
+}
+
 install_all() {
   need_root
+  if legacy_stack_present && [[ "$FORCE" != "1" ]]; then
+    warn "Detected existing lightcone/proxy-node stack at ${LEGACY_STATE_FILE}."
+    warn "Use menu option 2 to change its domain, option 3 to show links, or option 6 to inspect it."
+    warn "Run install with --yes only if you intentionally want to overwrite the existing stack."
+    return 0
+  fi
   detect_os
   install_packages
   prepare_server_name
@@ -854,38 +887,49 @@ install_all() {
   write_subscription_tools
   write_systemd
   start_services
+  install_shortcuts
   log "Installation completed"
   "$SHOW_SCRIPT"
 }
 
 show_status() {
   need_root
-  systemctl --no-pager --full status sing-box xray "${APP_NAME}-subscription" "${APP_NAME}-port-hopping" || true
+  if legacy_stack_present; then
+    systemctl --no-pager --full status sing-box xray proxy-subscription proxy-port-hopping || true
+  else
+    systemctl --no-pager --full status sing-box xray "${APP_NAME}-subscription" "${APP_NAME}-port-hopping" || true
+  fi
 }
 
 show_links() {
   need_root
-  [[ -x "$SHOW_SCRIPT" ]] || die "Not installed or missing ${SHOW_SCRIPT}"
-  "$SHOW_SCRIPT"
+  if [[ -f "$LEGACY_LINKS_FILE" ]]; then
+    cat "$LEGACY_LINKS_FILE"
+  elif [[ -x "$SHOW_SCRIPT" ]]; then
+    "$SHOW_SCRIPT"
+  else
+    die "Not installed or missing ${SHOW_SCRIPT}"
+  fi
 }
 
 show_existing_nodes() {
   need_root
   local found="0"
+  local legacy_links_printed="0"
   echo
   echo "Known subscription links / 已知订阅链接"
   echo "----------------------------------------"
-  if [[ -x "$SHOW_SCRIPT" ]]; then
+  if [[ -f "$LEGACY_LINKS_FILE" ]]; then
+    found="1"
+    legacy_links_printed="1"
+    cat "$LEGACY_LINKS_FILE"
+    echo
+  elif [[ -x "$SHOW_SCRIPT" ]]; then
     found="1"
     "$SHOW_SCRIPT" || true
     echo
   fi
-  if [[ -f /root/proxy-subscription-links.txt ]]; then
-    found="1"
-    cat /root/proxy-subscription-links.txt
-    echo
-  fi
-  if [[ -f /etc/proxy-node/credentials.env && -f /etc/proxy-node/sub_token ]]; then
+  if [[ "$legacy_links_printed" != "1" && -f /etc/proxy-node/credentials.env && -f /etc/proxy-node/sub_token ]]; then
     # shellcheck disable=SC1091
     . /etc/proxy-node/credentials.env
     local token
@@ -961,6 +1005,109 @@ set_state_value() {
   fi
 }
 
+set_file_value() {
+  local file="$1" key="$2" value="$3" escaped
+  escaped="$(quote_state_value "$value")"
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}='${escaped}'|" "$file"
+  else
+    printf "%s='%s'\n" "$key" "$escaped" >>"$file"
+  fi
+  chmod 600 "$file"
+}
+
+legacy_stack_present() {
+  [[ -f "$LEGACY_STATE_FILE" && -f "$LEGACY_TOKEN_FILE" && -x "$LEGACY_SUB_GENERATOR" ]]
+}
+
+sync_legacy_to_new_agent_state() {
+  mkdir -p "$STATE_DIR" "$CERT_DIR"
+  install -m 600 "$LEGACY_STATE_FILE" "$STATE_FILE"
+  install -m 600 "$LEGACY_TOKEN_FILE" "$TOKEN_FILE" 2>/dev/null || true
+  if [[ -d "$LEGACY_CERT_DIR" ]]; then
+    cp -f "$LEGACY_CERT_DIR"/fullchain.pem "$LEGACY_CERT_DIR"/privkey.pem "$CERT_DIR"/ 2>/dev/null || true
+    chmod 600 "$CERT_DIR"/* 2>/dev/null || true
+  fi
+}
+
+repair_legacy_sing_box_service() {
+  local sing_box_bin
+  sing_box_bin="$(command -v sing-box || true)"
+  [[ -n "$sing_box_bin" ]] || return 0
+  if [[ ! -x /usr/local/bin/sing-box ]] && systemctl cat sing-box 2>/dev/null | grep -q '/usr/local/bin/sing-box'; then
+    cat >/etc/systemd/system/sing-box.service <<EOF
+[Unit]
+Description=sing-box service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target network-online.target
+Wants=network-online.target
+
+[Service]
+User=sing-box
+StateDirectory=sing-box
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStart=${sing_box_bin} -D /var/lib/sing-box -C /etc/sing-box run
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+  fi
+}
+
+change_legacy_domain() {
+  need_root
+  # shellcheck disable=SC1090
+  . "$LEGACY_STATE_FILE"
+  echo
+  echo "Detected lightcone/proxy-node stack. New Agent will adapt it instead of overwriting it."
+  echo "Current server: ${DOMAIN:-unknown}"
+  read -r -p "New domain, blank for VPS IP self-signed mode: " DOMAIN
+  if [[ -n "$DOMAIN" ]]; then
+    read -r -p "ACME email, optional: " EMAIL
+    read -r -p "Force self-signed cert? [y/N]: " cert_ans
+    if [[ "$cert_ans" =~ ^[Yy]$ ]]; then
+      SKIP_CERT="1"
+    else
+      SKIP_CERT="0"
+    fi
+  else
+    EMAIL=""
+    SKIP_CERT="0"
+  fi
+  prepare_server_name
+  local legacy_domain_value="$SERVER_NAME"
+  set_file_value "$LEGACY_STATE_FILE" DOMAIN "$legacy_domain_value"
+  set_file_value "$LEGACY_STATE_FILE" SERVER_NAME "$SERVER_NAME"
+  set_file_value "$LEGACY_STATE_FILE" CERT_MODE "$CERT_MODE"
+  set_file_value "$LEGACY_STATE_FILE" TLS_INSECURE "$TLS_INSECURE"
+
+  local saved_cert_dir="$CERT_DIR"
+  CERT_DIR="$LEGACY_CERT_DIR"
+  issue_cert
+  if [[ "$CERT_MODE" == "acme" && -x "$HOME/.acme.sh/acme.sh" ]]; then
+    "$HOME/.acme.sh/acme.sh" --install-cert -d "$SERVER_NAME" --ecc \
+      --fullchain-file "${LEGACY_CERT_DIR}/fullchain.pem" \
+      --key-file "${LEGACY_CERT_DIR}/privkey.pem" \
+      --reloadcmd "systemctl restart sing-box xray proxy-subscription.service >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  fi
+  CERT_DIR="$saved_cert_dir"
+
+  sync_legacy_to_new_agent_state
+  systemctl disable --now "${APP_NAME}-subscription" "${APP_NAME}-port-hopping" >/dev/null 2>&1 || true
+  "$LEGACY_SUB_GENERATOR"
+  repair_legacy_sing_box_service
+  systemctl restart sing-box xray proxy-subscription proxy-port-hopping >/dev/null 2>&1 || true
+  install_shortcuts
+  log "Legacy lightcone domain changed without overwriting the working stack."
+  [[ -f "$LEGACY_LINKS_FILE" ]] && cat "$LEGACY_LINKS_FILE"
+}
+
 prompt_install_options() {
   read -r -p "请输入域名，可留空使用 VPS IP / Domain, blank for VPS IP: " DOMAIN
   if [[ -n "$DOMAIN" ]]; then
@@ -975,6 +1122,10 @@ prompt_install_options() {
 
 change_domain() {
   need_root
+  if legacy_stack_present; then
+    change_legacy_domain
+    return
+  fi
   [[ -f "$STATE_FILE" ]] || die "New Agent is not installed."
   # shellcheck disable=SC1090
   . "$STATE_FILE"
@@ -1004,6 +1155,7 @@ change_domain() {
   write_subscription_tools
   write_systemd
   start_services
+  install_shortcuts
   log "Domain changed / 域名已更换"
   "$SHOW_SCRIPT"
 }
@@ -1082,7 +1234,7 @@ EOF
 }
 
 case "$ACTION" in
-  menu) main_menu ;;
+  menu|sh|shell) main_menu ;;
   install) install_all ;;
   change-domain) change_domain ;;
   status) show_status ;;
