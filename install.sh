@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="new-agent"
 APP_TITLE="New Agent"
-APP_VERSION="0.4.1"
+APP_VERSION="0.4.2"
 
 if [[ -z "${LANG:-}" || "${LANG}" != *UTF-8* ]]; then
   export LANG=C.UTF-8
@@ -321,19 +321,7 @@ EOF
 issue_cert() {
   mkdir -p "$CERT_DIR"
   if [[ "$CERT_MODE" == "self-signed" ]]; then
-    local san
-    if [[ "$SERVER_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      san="IP:${SERVER_NAME}"
-    else
-      san="DNS:${SERVER_NAME}"
-    fi
-    warn "Generating self-signed certificate for ${SERVER_NAME}."
-    warn "Clients must enable skip certificate verification/insecure for certificate-based nodes and subscription import."
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-      -subj "/CN=${SERVER_NAME}" \
-      -addext "subjectAltName=${san}" \
-      -keyout "${CERT_DIR}/privkey.pem" \
-      -out "${CERT_DIR}/fullchain.pem" >/dev/null 2>&1
+    generate_self_signed_cert
     return
   fi
   if [[ ! -d "$HOME/.acme.sh" ]]; then
@@ -342,14 +330,73 @@ issue_cert() {
   fi
   export PATH="$HOME/.acme.sh:$PATH"
   "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null
+  if install_existing_acme_cert; then
+    log "Reused existing ACME certificate for ${DOMAIN}"
+    return
+  fi
   info "Issuing certificate for ${DOMAIN}"
   systemctl stop sing-box xray "${APP_NAME}-subscription" >/dev/null 2>&1 || true
-  "$HOME/.acme.sh/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256 --force
+  if ! "$HOME/.acme.sh/acme.sh" --issue -d "$DOMAIN" --standalone --keylength ec-256; then
+    if install_existing_acme_cert; then
+      warn "ACME issue failed, reused existing local certificate for ${DOMAIN}."
+      return
+    fi
+    warn "ACME issue failed and no reusable certificate was found."
+    warn "This is often caused by Let's Encrypt rate limits after repeated uninstall/reinstall."
+    warn "Falling back to a self-signed certificate so the proxy stack can start now."
+    mark_self_signed_cert_mode
+    generate_self_signed_cert
+    return
+  fi
   "$HOME/.acme.sh/acme.sh" --install-cert -d "$DOMAIN" --ecc \
     --fullchain-file "${CERT_DIR}/fullchain.pem" \
     --key-file "${CERT_DIR}/privkey.pem" \
     --reloadcmd "systemctl restart sing-box ${APP_NAME}-subscription xray >/dev/null 2>&1 || true"
   chmod 600 "${CERT_DIR}/privkey.pem"
+}
+
+generate_self_signed_cert() {
+  local san
+  if [[ "$SERVER_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    san="IP:${SERVER_NAME}"
+  else
+    san="DNS:${SERVER_NAME}"
+  fi
+  warn "Generating self-signed certificate for ${SERVER_NAME}."
+  warn "Clients must enable skip certificate verification/insecure for certificate-based nodes and subscription import."
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -subj "/CN=${SERVER_NAME}" \
+    -addext "subjectAltName=${san}" \
+    -keyout "${CERT_DIR}/privkey.pem" \
+    -out "${CERT_DIR}/fullchain.pem" >/dev/null 2>&1
+  chmod 600 "${CERT_DIR}/privkey.pem"
+}
+
+install_existing_acme_cert() {
+  [[ -n "$DOMAIN" && -x "$HOME/.acme.sh/acme.sh" ]] || return 1
+  local acme_dir="${HOME}/.acme.sh/${DOMAIN}_ecc"
+  local fullchain="${acme_dir}/fullchain.cer"
+  local key="${acme_dir}/${DOMAIN}.key"
+  [[ -s "$fullchain" && -s "$key" ]] || return 1
+  if ! openssl x509 -checkend 604800 -noout -in "$fullchain" >/dev/null 2>&1; then
+    return 1
+  fi
+  "$HOME/.acme.sh/acme.sh" --install-cert -d "$DOMAIN" --ecc \
+    --fullchain-file "${CERT_DIR}/fullchain.pem" \
+    --key-file "${CERT_DIR}/privkey.pem" \
+    --reloadcmd "systemctl restart sing-box ${APP_NAME}-subscription xray >/dev/null 2>&1 || true" >/dev/null
+  chmod 600 "${CERT_DIR}/privkey.pem"
+}
+
+mark_self_signed_cert_mode() {
+  CERT_MODE="self-signed"
+  TLS_INSECURE="true"
+  if [[ -f "$STATE_FILE" ]]; then
+    sed -i \
+      -e "s/^CERT_MODE=.*/CERT_MODE='self-signed'/" \
+      -e "s/^TLS_INSECURE=.*/TLS_INSECURE='true'/" \
+      "$STATE_FILE"
+  fi
 }
 
 generate_keys() {
@@ -1187,9 +1234,8 @@ uninstall_all() {
   systemctl disable --now sing-box xray "${APP_NAME}-subscription" "${APP_NAME}-port-hopping" >/dev/null 2>&1 || true
   iptables -t nat -D PREROUTING -p udp --dport 40000:40100 -j REDIRECT --to-ports 30000 2>/dev/null || true
   iptables -t nat -D PREROUTING -p udp --dport 41000:41100 -j REDIRECT --to-ports 30001 2>/dev/null || true
-  if [[ -n "$old_domain" && -x "$HOME/.acme.sh/acme.sh" ]]; then
-    "$HOME/.acme.sh/acme.sh" --remove -d "$old_domain" --ecc >/dev/null 2>&1 || true
-    rm -rf "$HOME/.acme.sh/${old_domain}_ecc" "$HOME/.acme.sh/${old_domain}"
+  if [[ -n "$old_domain" && -d "$HOME/.acme.sh" ]]; then
+    warn "Keeping ACME cache for ${old_domain} to avoid Let's Encrypt reinstall rate limits."
   fi
   rm -f "$UNIT_SUB" "$UNIT_HOP" /etc/systemd/system/sing-box.service /etc/systemd/system/xray.service
   rm -rf /etc/systemd/system/sing-box.service.d /etc/systemd/system/xray.service.d
