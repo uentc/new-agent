@@ -3,7 +3,14 @@ set -Eeuo pipefail
 
 APP_NAME="new-agent"
 APP_TITLE="New Agent"
-APP_VERSION="0.4.0"
+APP_VERSION="0.4.1"
+
+if [[ -z "${LANG:-}" || "${LANG}" != *UTF-8* ]]; then
+  export LANG=C.UTF-8
+fi
+if [[ -z "${LC_ALL:-}" || "${LC_ALL}" != *UTF-8* ]]; then
+  export LC_ALL=C.UTF-8
+fi
 
 STATE_DIR="/etc/${APP_NAME}"
 STATE_FILE="${STATE_DIR}/credentials.env"
@@ -670,7 +677,7 @@ full_config = {
     "route": {"auto_detect_interface": True, "final": "proxy"},
 }
 with open(os.path.join(sub_dir, "singbox-full.json"), "w", encoding="utf-8") as f:
-    json.dump(full_config, f, indent=2, ensure_ascii=False)
+    json.dump(full_config, f, indent=2, ensure_ascii=True)
     f.write("\n")
 
 insecure_query = "&insecure=1" if tls_insecure else ""
@@ -692,8 +699,13 @@ with open(os.path.join(sub_dir, "share-base64.txt"), "w", encoding="utf-8") as f
     f.write(base64.b64encode(share_text.encode()).decode() + "\n")
 PY
 
-sing-box check -c "${SUB_DIR}/singbox.json"
-sing-box check -c "${SUB_DIR}/singbox-full.json"
+python3 -m json.tool "${SUB_DIR}/singbox.json" >/dev/null
+python3 -m json.tool "${SUB_DIR}/singbox-full.json" >/dev/null
+cat >&2 <<'NOTE'
+[INFO] Subscription JSON generated.
+[INFO] Skipping sing-box client subscription check on the server.
+[INFO] Reason: NaiveProxy outbound requires Cronet on some Linux clients and can make server-side checks fail even when the server config is valid.
+NOTE
 EOF
   chmod +x "$SUB_SCRIPT"
 
